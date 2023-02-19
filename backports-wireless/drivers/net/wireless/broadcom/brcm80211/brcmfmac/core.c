@@ -1,32 +1,19 @@
+// SPDX-License-Identifier: ISC
 /*
  * Copyright (c) 2010 Broadcom Corporation
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
- * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
- * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
- * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
 #include <linux/kernel.h>
 #include <linux/etherdevice.h>
 #include <linux/module.h>
 #include <linux/inetdevice.h>
-#include <linux/wakelock.h>
 #include <net/cfg80211.h>
 #include <net/rtnetlink.h>
 #include <net/addrconf.h>
+#include <net/ieee80211_radiotap.h>
 #include <net/ipv6.h>
 #include <brcmu_utils.h>
 #include <brcmu_wifi.h>
-#include <linux/regulator/consumer.h>
-#include <defs.h>
 
 #include "core.h"
 #include "bus.h"
@@ -40,8 +27,12 @@
 #include "proto.h"
 #include "pcie.h"
 #include "common.h"
-#include "android.h"
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+#include <linux/regulator/consumer.h>
+#include <defs.h>
 #include "fwsignal.h"
+#include "android.h"
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
 
 #define MAX_WAIT_FOR_8021X_TX			msecs_to_jiffies(950)
 
@@ -49,25 +40,64 @@
 
 #define BRCMF_BSSIDX_INVALID			-1
 
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
-#define MAX_WAIT_FOR_BUS_START			msecs_to_jiffies(60000)
+#define	RXS_PBPRES				BIT(2)
+
+#define	D11_PHY_HDR_LEN				6
+
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+#define MAX_WAIT_FOR_BUS_START			msecs_to_jiffies(20000)
+
 struct brcmf_pub *g_drvr;
-#endif
 
 static int brcmf_android_netdev_open(struct net_device *ndev);
 static int brcmf_android_netdev_stop(struct net_device *ndev);
-static int brcmf_android_ioctl_entry(struct net_device *net,
-				     struct ifreq *ifr, int cmd);
 static netdev_tx_t brcmf_android_netdev_start_xmit(struct sk_buff *skb,
 						   struct net_device *ndev);
 static int brcmf_android_netdev_set_mac_address(struct net_device *ndev,
 						void *addr);
 static int brcmf_android_net_p2p_open(struct net_device *ndev);
 static int brcmf_android_net_p2p_stop(struct net_device *ndev);
-static int brcmf_android_priv_cmd(struct net_device *ndev, struct ifreq *ifr,
-				  int cmd);
 static netdev_tx_t brcmf_android_net_p2p_start_xmit(struct sk_buff *skb,
 						    struct net_device *ndev);
+
+struct d11rxhdr_le {
+	__le16 RxFrameSize;
+	u16 PAD;
+	__le16 PhyRxStatus_0;
+	__le16 PhyRxStatus_1;
+	__le16 PhyRxStatus_2;
+	__le16 PhyRxStatus_3;
+	__le16 PhyRxStatus_4;
+	__le16 PhyRxStatus_5;
+	__le16 RxStatus1;
+	__le16 RxStatus2;
+	__le16 RxTSFTime;
+	__le16 RxChan;
+	u8 unknown[12];
+} __packed;
+
+struct wlc_d11rxhdr {
+	struct d11rxhdr_le rxhdr;
+	__le32 tsf_l;
+	s8 rssi;
+	s8 rxpwr0;
+	s8 rxpwr1;
+	s8 do_rssi_ma;
+	s8 rxpwr[4];
+} __packed;
+
+#define BRCMF_IF_STA_LIST_LOCK_INIT(ifp) spin_lock_init(&(ifp)->sta_list_lock)
+#define BRCMF_IF_STA_LIST_LOCK(ifp, flags) \
+	spin_lock_irqsave(&(ifp)->sta_list_lock, (flags))
+#define BRCMF_IF_STA_LIST_UNLOCK(ifp, flags) \
+	spin_unlock_irqrestore(&(ifp)->sta_list_lock, (flags))
+
+#define BRCMF_STA_NULL ((struct brcmf_sta *)NULL)
+static int brcmf_android_priv_cmd(struct net_device *ndev, struct ifreq *ifr,
+				  int cmd);
+static int brcmf_android_ioctl_entry(struct net_device *net,
+				     struct ifreq *ifr, int cmd);
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
 
 char *brcmf_ifname(struct brcmf_if *ifp)
 {
@@ -86,7 +116,7 @@ struct brcmf_if *brcmf_get_ifp(struct brcmf_pub *drvr, int ifidx)
 	s32 bsscfgidx;
 
 	if (ifidx < 0 || ifidx >= BRCMF_MAX_IFS) {
-		brcmf_err("ifidx %d out of range\n", ifidx);
+		bphy_err(drvr, "ifidx %d out of range\n", ifidx);
 		return NULL;
 	}
 
@@ -98,9 +128,48 @@ struct brcmf_if *brcmf_get_ifp(struct brcmf_pub *drvr, int ifidx)
 	return ifp;
 }
 
+void brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
+{
+	s32 err;
+	u32 mode;
+
+	if (enable)
+		mode = BRCMF_ARP_OL_AGENT | BRCMF_ARP_OL_PEER_AUTO_REPLY;
+	else
+		mode = 0;
+
+	/* Try to set and enable ARP offload feature, this may fail, then it  */
+	/* is simply not supported and err 0 will be returned                 */
+	err = brcmf_fil_iovar_int_set(ifp, "arp_ol", mode);
+	if (err) {
+		brcmf_dbg(TRACE, "failed to set ARP offload mode to 0x%x, err = %d\n",
+			  mode, err);
+	} else {
+		err = brcmf_fil_iovar_int_set(ifp, "arpoe", enable);
+		if (err) {
+			brcmf_dbg(TRACE, "failed to configure (%d) ARP offload err = %d\n",
+				  enable, err);
+		} else {
+			brcmf_dbg(TRACE, "successfully configured (%d) ARP offload to 0x%x\n",
+				  enable, mode);
+		}
+	}
+
+	err = brcmf_fil_iovar_int_set(ifp, "ndoe", enable);
+	if (err) {
+		brcmf_dbg(TRACE, "failed to configure (%d) ND offload err = %d\n",
+			  enable, err);
+	} else {
+		brcmf_dbg(TRACE, "successfully configured (%d) ND offload to 0x%x\n",
+			  enable, mode);
+	}
+}
+
 static void _brcmf_set_multicast_list(struct work_struct *work)
 {
-	struct brcmf_if *ifp;
+	struct brcmf_if *ifp = container_of(work, struct brcmf_if,
+					    multicast_work);
+	struct brcmf_pub *drvr = ifp->drvr;
 	struct net_device *ndev;
 	struct netdev_hw_addr *ha;
 	u32 cmd_value, cnt;
@@ -109,11 +178,11 @@ static void _brcmf_set_multicast_list(struct work_struct *work)
 	u32 buflen;
 	s32 err;
 
-	ifp = container_of(work, struct brcmf_if, multicast_work);
-
-	brcmf_android_wake_lock(ifp->drvr);
-
 	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d\n", ifp->bsscfgidx);
+
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+	brcmf_android_wake_lock(ifp->drvr);
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
 
 	ndev = ifp->ndev;
 
@@ -125,7 +194,9 @@ static void _brcmf_set_multicast_list(struct work_struct *work)
 	buflen = sizeof(cnt) + (cnt * ETH_ALEN);
 	buf = kmalloc(buflen, GFP_ATOMIC);
 	if (!buf) {
+#ifdef CPTCFG_BRCMFMAC_ANDROID
 		brcmf_android_wake_unlock(ifp->drvr);
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
 		return;
 	}
 	bufp = buf;
@@ -144,7 +215,7 @@ static void _brcmf_set_multicast_list(struct work_struct *work)
 
 	err = brcmf_fil_iovar_data_set(ifp, "mcast_list", buf, buflen);
 	if (err < 0) {
-		brcmf_err("Setting mcast_list failed, %d\n", err);
+		bphy_err(drvr, "Setting mcast_list failed, %d\n", err);
 		cmd_value = cnt ? true : cmd_value;
 	}
 
@@ -157,25 +228,26 @@ static void _brcmf_set_multicast_list(struct work_struct *work)
 	 */
 	err = brcmf_fil_iovar_int_set(ifp, "allmulti", cmd_value);
 	if (err < 0)
-		brcmf_err("Setting allmulti failed, %d\n", err);
+		bphy_err(drvr, "Setting allmulti failed, %d\n", err);
 
 	/*Finally, pick up the PROMISC flag */
 	cmd_value = (ndev->flags & IFF_PROMISC) ? true : false;
 	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PROMISC, cmd_value);
 	if (err < 0)
-		brcmf_err("Setting BRCMF_C_SET_PROMISC failed, %d\n",
-			  err);
-
+		bphy_err(drvr, "Setting BRCMF_C_SET_PROMISC failed, %d\n",
+			 err);
+#ifdef CPTCFG_BRCMFMAC_ANDROID
 	brcmf_android_wake_unlock(ifp->drvr);
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
 }
 
 #if IS_ENABLED(CONFIG_IPV6)
 static void _brcmf_update_ndtable(struct work_struct *work)
 {
-	struct brcmf_if *ifp;
+	struct brcmf_if *ifp = container_of(work, struct brcmf_if,
+					    ndoffload_work);
+	struct brcmf_pub *drvr = ifp->drvr;
 	int i, ret;
-
-	ifp = container_of(work, struct brcmf_if, ndoffload_work);
 
 	/* clear the table in firmware */
 	ret = brcmf_fil_iovar_data_set(ifp, "nd_hostip_clear", NULL, 0);
@@ -189,7 +261,7 @@ static void _brcmf_update_ndtable(struct work_struct *work)
 					       &ifp->ipv6_addr_tbl[i],
 					       sizeof(struct in6_addr));
 		if (ret)
-			brcmf_err("add nd ip err %d\n", ret);
+			bphy_err(drvr, "add nd ip err %d\n", ret);
 	}
 }
 #else
@@ -202,6 +274,7 @@ static int brcmf_netdev_set_mac_address(struct net_device *ndev, void *addr)
 {
 	struct brcmf_if *ifp = netdev_priv(ndev);
 	struct sockaddr *sa = (struct sockaddr *)addr;
+	struct brcmf_pub *drvr = ifp->drvr;
 	int err;
 
 	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d\n", ifp->bsscfgidx);
@@ -209,12 +282,23 @@ static int brcmf_netdev_set_mac_address(struct net_device *ndev, void *addr)
 	err = brcmf_fil_iovar_data_set(ifp, "cur_etheraddr", sa->sa_data,
 				       ETH_ALEN);
 	if (err < 0) {
-		brcmf_err("Setting cur_etheraddr failed, %d\n", err);
+		bphy_err(drvr, "Setting cur_etheraddr failed, %d\n", err);
 	} else {
 		brcmf_dbg(TRACE, "updated to %pM\n", sa->sa_data);
 		memcpy(ifp->mac_addr, sa->sa_data, ETH_ALEN);
 		memcpy(ifp->ndev->dev_addr, ifp->mac_addr, ETH_ALEN);
 	}
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+	if (ifp->bsscfgidx == 0 && err == -EIO) {
+		/* return OK for primary interface when bus is down */
+		return -5;
+		brcmf_dbg(INFO, "bus is down, update MAC to %pM when it's up\n",
+			  sa->sa_data);
+		memcpy(ifp->mac_addr, sa->sa_data, ETH_ALEN);
+		memcpy(ifp->ndev->dev_addr, ifp->mac_addr, ETH_ALEN);
+	}
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
+
 	return err;
 }
 
@@ -223,6 +307,37 @@ static void brcmf_netdev_set_multicast_list(struct net_device *ndev)
 	struct brcmf_if *ifp = netdev_priv(ndev);
 
 	schedule_work(&ifp->multicast_work);
+}
+
+/**
+ * brcmf_skb_is_iapp - checks if skb is an IAPP packet
+ *
+ * @skb: skb to check
+ */
+static bool brcmf_skb_is_iapp(struct sk_buff *skb)
+{
+	static const u8 iapp_l2_update_packet[6] __aligned(2) = {
+		0x00, 0x01, 0xaf, 0x81, 0x01, 0x00,
+	};
+	unsigned char *eth_data;
+#if !defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
+	const u16 *a, *b;
+#endif
+
+	if (skb->len - skb->mac_len != 6 ||
+	    !is_multicast_ether_addr(eth_hdr(skb)->h_dest))
+		return false;
+
+	eth_data = skb_mac_header(skb) + ETH_HLEN;
+#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
+	return !(((*(const u32 *)eth_data) ^ (*(const u32 *)iapp_l2_update_packet)) |
+		 ((*(const u16 *)(eth_data + 4)) ^ (*(const u16 *)(iapp_l2_update_packet + 4))));
+#else
+	a = (const u16 *)eth_data;
+	b = (const u16 *)iapp_l2_update_packet;
+
+	return !((a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2]));
+#endif
 }
 
 static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
@@ -237,11 +352,33 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
 	brcmf_dbg(DATA, "Enter, bsscfgidx=%d\n", ifp->bsscfgidx);
 
 	/* Can the device send data? */
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+	if (drvr->bus_if->state != BRCMF_BUS_UP ||
+	    brcmf_android_in_reset(drvr)) {
+#else
 	if (drvr->bus_if->state != BRCMF_BUS_UP) {
-		brcmf_err("xmit rejected state=%d\n", drvr->bus_if->state);
+#endif
+		bphy_err(drvr, "xmit rejected state=%d\n", drvr->bus_if->state);
 		netif_stop_queue(ndev);
 		dev_kfree_skb(skb);
 		ret = -ENODEV;
+		goto done;
+	}
+
+	/* Some recent Broadcom's firmwares disassociate STA when they receive
+	 * an 802.11f ADD frame. This behavior can lead to a local DoS security
+	 * issue. Attacker may trigger disassociation of any STA by sending a
+	 * proper Ethernet frame to the wireless interface.
+	 *
+	 * Moreover this feature may break AP interfaces in some specific
+	 * setups. This applies e.g. to the bridge with hairpin mode enabled and
+	 * IFLA_BRPORT_MCAST_TO_UCAST set. IAPP packet generated by a firmware
+	 * will get passed back to the wireless interface and cause immediate
+	 * disassociation of a just-connected STA.
+	 */
+	if (!drvr->settings->iapp && brcmf_skb_is_iapp(skb)) {
+		dev_kfree_skb(skb);
+		ret = -EINVAL;
 		goto done;
 	}
 
@@ -255,8 +392,8 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
 		ret = pskb_expand_head(skb, ALIGN(head_delta, NET_SKB_PAD), 0,
 				       GFP_ATOMIC);
 		if (ret < 0) {
-			brcmf_err("%s: failed to expand headroom\n",
-				  brcmf_ifname(ifp));
+			bphy_err(drvr, "%s: failed to expand headroom\n",
+				 brcmf_ifname(ifp));
 			atomic_inc(&drvr->bus_if->stats.pktcow_failed);
 			goto done;
 		}
@@ -277,6 +414,9 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
 	/* determine the priority */
 	if ((skb->priority == 0) || (skb->priority > 7))
 		skb->priority = cfg80211_classify8021d(skb, NULL);
+
+	/* set pacing shift for packet aggregation */
+	sk_pacing_shift_update(skb->sk, 8);
 
 	ret = brcmf_proto_tx_queue_data(drvr, ifp->ifidx, skb);
 	if (ret < 0)
@@ -320,6 +460,18 @@ void brcmf_txflowblock_if(struct brcmf_if *ifp,
 
 void brcmf_netif_rx(struct brcmf_if *ifp, struct sk_buff *skb)
 {
+	/* Most of Broadcom's firmwares send 802.11f ADD frame every time a new
+	 * STA connects to the AP interface. This is an obsoleted standard most
+	 * users don't use, so don't pass these frames up unless requested.
+	 */
+	if (!ifp->drvr->settings->iapp && brcmf_skb_is_iapp(skb)) {
+		brcmu_pkt_buf_free_skb(skb);
+		return;
+	}
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+	brcmf_android_add_wake_pkt_cnts(ifp->drvr, skb);
+#endif
+
 	if (skb->pkt_type == PACKET_MULTICAST)
 		ifp->ndev->stats.multicast++;
 
@@ -340,6 +492,55 @@ void brcmf_netif_rx(struct brcmf_if *ifp, struct sk_buff *skb)
 		 * the NET_RX_SOFTIRQ.  This is handled by netif_rx_ni().
 		 */
 		netif_rx_ni(skb);
+}
+
+void brcmf_netif_mon_rx(struct brcmf_if *ifp, struct sk_buff *skb)
+{
+	if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_MONITOR_FMT_RADIOTAP)) {
+		/* Do nothing */
+	} else if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_MONITOR_FMT_HW_RX_HDR)) {
+		struct wlc_d11rxhdr *wlc_rxhdr = (struct wlc_d11rxhdr *)skb->data;
+		struct ieee80211_radiotap_header *radiotap;
+		unsigned int offset;
+		u16 RxStatus1;
+
+		RxStatus1 = le16_to_cpu(wlc_rxhdr->rxhdr.RxStatus1);
+
+		offset = sizeof(struct wlc_d11rxhdr);
+		/* MAC inserts 2 pad bytes for a4 headers or QoS or A-MSDU
+		 * subframes
+		 */
+		if (RxStatus1 & RXS_PBPRES)
+			offset += 2;
+		offset += D11_PHY_HDR_LEN;
+
+		skb_pull(skb, offset);
+
+		/* TODO: use RX header to fill some radiotap data */
+		radiotap = skb_push(skb, sizeof(*radiotap));
+		memset(radiotap, 0, sizeof(*radiotap));
+		radiotap->it_len = cpu_to_le16(sizeof(*radiotap));
+
+		/* TODO: 4 bytes with receive status? */
+		skb->len -= 4;
+	} else {
+		struct ieee80211_radiotap_header *radiotap;
+
+		/* TODO: use RX status to fill some radiotap data */
+		radiotap = skb_push(skb, sizeof(*radiotap));
+		memset(radiotap, 0, sizeof(*radiotap));
+		radiotap->it_len = cpu_to_le16(sizeof(*radiotap));
+
+		/* TODO: 4 bytes with receive status? */
+		skb->len -= 4;
+	}
+
+	skb->dev = ifp->ndev;
+	skb_reset_mac_header(skb);
+	skb->pkt_type = PACKET_OTHERHOST;
+	skb->protocol = htons(ETH_P_802_2);
+
+	brcmf_netif_rx(ifp, skb);
 }
 
 static int brcmf_rx_hdrpull(struct brcmf_pub *drvr, struct sk_buff *skb,
@@ -377,7 +578,8 @@ void brcmf_rx_frame(struct device *dev, struct sk_buff *skb, bool handle_event)
 	} else {
 		/* Process special event packets */
 		if (handle_event)
-			brcmf_fweh_process_skb(ifp->drvr, skb);
+			brcmf_fweh_process_skb(ifp->drvr, skb,
+					       BCMILCP_SUBTYPE_VENDOR_LONG);
 
 		brcmf_netif_rx(ifp, skb);
 	}
@@ -394,7 +596,7 @@ void brcmf_rx_event(struct device *dev, struct sk_buff *skb)
 	if (brcmf_rx_hdrpull(drvr, skb, &ifp))
 		return;
 
-	brcmf_fweh_process_skb(ifp->drvr, skb);
+	brcmf_fweh_process_skb(ifp->drvr, skb, 0);
 	brcmu_pkt_buf_free_skb(skb);
 }
 
@@ -402,6 +604,11 @@ void brcmf_txfinalize(struct brcmf_if *ifp, struct sk_buff *txp, bool success)
 {
 	struct ethhdr *eh;
 	u16 type;
+
+	if (!ifp) {
+		brcmu_pkt_buf_free_skb(txp);
+		return;
+	}
 
 	eh = (struct ethhdr *)(txp->data);
 	type = ntohs(eh->h_proto);
@@ -425,9 +632,9 @@ static void brcmf_ethtool_get_drvinfo(struct net_device *ndev,
 	struct brcmf_pub *drvr = ifp->drvr;
 	char drev[BRCMU_DOTREV_LEN] = "n/a";
 
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
+#ifdef CPTCFG_BRCMFMAC_ANDROID
 	if (!brcmf_android_wifi_is_on(drvr) ||
-	    brcmf_android_in_reset(drvr)) {
+		brcmf_android_in_reset(drvr)) {
 		brcmf_dbg(INFO, "wifi is not ready\n");
 		return;
 	}
@@ -470,7 +677,7 @@ static int brcmf_netdev_open(struct net_device *ndev)
 
 	/* If bus is not ready, can't continue */
 	if (bus_if->state != BRCMF_BUS_UP) {
-		brcmf_err("failed bus is not ready\n");
+		bphy_err(drvr, "failed bus is not ready\n");
 		return -EAGAIN;
 	}
 
@@ -484,10 +691,10 @@ static int brcmf_netdev_open(struct net_device *ndev)
 		ndev->features &= ~NETIF_F_IP_CSUM;
 
 	if (brcmf_cfg80211_up(ndev)) {
-		brcmf_err("failed to bring up cfg80211\n");
+		bphy_err(drvr, "failed to bring up cfg80211\n");
 		return -EIO;
 	}
-#if !defined(CPTCFG_BRCMFMAC_ANDROID)
+#ifndef CPTCFG_BRCMFMAC_ANDROID
 	/* Clear, carrier, set when connected or AP mode. */
 	netif_carrier_off(ndev);
 #endif /* !defined(CPTCFG_BRCMFMAC_ANDROID) */
@@ -495,6 +702,7 @@ static int brcmf_netdev_open(struct net_device *ndev)
 	return 0;
 }
 
+#ifdef CPTCFG_BRCMFMAC_ANDROID
 static const struct net_device_ops brcmf_netdev_ops_pri = {
 	.ndo_open = brcmf_android_netdev_open,
 	.ndo_stop = brcmf_android_netdev_stop,
@@ -503,6 +711,15 @@ static const struct net_device_ops brcmf_netdev_ops_pri = {
 	.ndo_set_mac_address = brcmf_android_netdev_set_mac_address,
 	.ndo_set_rx_mode = brcmf_netdev_set_multicast_list
 };
+#else
+static const struct net_device_ops brcmf_netdev_ops_pri = {
+	.ndo_open = brcmf_netdev_open,
+	.ndo_stop = brcmf_netdev_stop,
+	.ndo_start_xmit = brcmf_netdev_start_xmit,
+	.ndo_set_mac_address = brcmf_netdev_set_mac_address,
+	.ndo_set_rx_mode = brcmf_netdev_set_multicast_list
+};
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
 
 #undef netdev_set_priv_destructor
 #if LINUX_VERSION_IS_LESS(4,11,9)
@@ -549,7 +766,7 @@ int brcmf_net_attach(struct brcmf_if *ifp, bool rtnl_locked)
 	else
 		err = register_netdev(ndev);
 	if (err != 0) {
-		brcmf_err("couldn't register the net device\n");
+		bphy_err(drvr, "couldn't register the net device\n");
 		goto fail;
 	}
 
@@ -585,7 +802,7 @@ void brcmf_net_setcarrier(struct brcmf_if *ifp, bool on)
 
 	ndev = ifp->ndev;
 	brcmf_txflowblock_if(ifp, BRCMF_NETIF_STOP_REASON_DISCONNECTED, !on);
-#if !defined(CPTCFG_BRCMFMAC_ANDROID)
+#ifndef CPTCFG_BRCMFMAC_ANDROID
 	if (on) {
 		if (!netif_carrier_ok(ndev))
 			netif_carrier_on(ndev);
@@ -621,14 +838,22 @@ static netdev_tx_t brcmf_net_p2p_start_xmit(struct sk_buff *skb,
 }
 
 static const struct net_device_ops brcmf_netdev_ops_p2p = {
+#ifdef CPTCFG_BRCMFMAC_ANDROID
 	.ndo_open = brcmf_android_net_p2p_open,
 	.ndo_stop = brcmf_android_net_p2p_stop,
 	.ndo_do_ioctl = brcmf_android_ioctl_entry,
 	.ndo_start_xmit = brcmf_android_net_p2p_start_xmit
+#else
+	.ndo_open = brcmf_net_p2p_open,
+	.ndo_stop = brcmf_net_p2p_stop,
+	.ndo_start_xmit = brcmf_net_p2p_start_xmit
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
 };
+
 
 static int brcmf_net_p2p_attach(struct brcmf_if *ifp)
 {
+	struct brcmf_pub *drvr = ifp->drvr;
 	struct net_device *ndev;
 
 	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d mac=%pM\n", ifp->bsscfgidx,
@@ -641,7 +866,7 @@ static int brcmf_net_p2p_attach(struct brcmf_if *ifp)
 	memcpy(ndev->dev_addr, ifp->mac_addr, ETH_ALEN);
 
 	if (register_netdev(ndev) != 0) {
-		brcmf_err("couldn't register the p2p net device\n");
+		bphy_err(drvr, "couldn't register the p2p net device\n");
 		goto fail;
 	}
 
@@ -670,8 +895,8 @@ struct brcmf_if *brcmf_add_if(struct brcmf_pub *drvr, s32 bsscfgidx, s32 ifidx,
 	 */
 	if (ifp) {
 		if (ifidx) {
-			brcmf_err("ERROR: netdev:%s already exists\n",
-				  ifp->ndev->name);
+			bphy_err(drvr, "ERROR: netdev:%s already exists\n",
+				 ifp->ndev->name);
 			netif_stop_queue(ifp->ndev);
 			brcmf_net_detach(ifp->ndev, false);
 			drvr->iflist[bsscfgidx] = NULL;
@@ -712,12 +937,14 @@ struct brcmf_if *brcmf_add_if(struct brcmf_pub *drvr, s32 bsscfgidx, s32 ifidx,
 	drvr->iflist[bsscfgidx] = ifp;
 	ifp->ifidx = ifidx;
 	ifp->bsscfgidx = bsscfgidx;
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
+#ifdef CPTCFG_BRCMFMAC_ANDROID
 	init_waitqueue_head(&ifp->pend_dev_reset_wait);
 #endif
 	init_waitqueue_head(&ifp->pend_8021x_wait);
 	spin_lock_init(&ifp->netif_stop_lock);
-
+	BRCMF_IF_STA_LIST_LOCK_INIT(ifp);
+	 /* Initialize STA info list */
+	INIT_LIST_HEAD(&ifp->sta_list);
 	if (mac_addr != NULL)
 		memcpy(ifp->mac_addr, mac_addr, ETH_ALEN);
 
@@ -731,20 +958,27 @@ static void brcmf_del_if(struct brcmf_pub *drvr, s32 bsscfgidx,
 			 bool rtnl_locked)
 {
 	struct brcmf_if *ifp;
+	int ifidx;
 
 	ifp = drvr->iflist[bsscfgidx];
-	drvr->iflist[bsscfgidx] = NULL;
 	if (!ifp) {
-		brcmf_err("Null interface, bsscfgidx=%d\n", bsscfgidx);
+		bphy_err(drvr, "Null interface, bsscfgidx=%d\n", bsscfgidx);
 		return;
 	}
 	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d, ifidx=%d\n", bsscfgidx,
 		  ifp->ifidx);
-	if (drvr->if2bss[ifp->ifidx] == bsscfgidx)
-		drvr->if2bss[ifp->ifidx] = BRCMF_BSSIDX_INVALID;
+	ifidx = ifp->ifidx;
+
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+	if (ifp->bsscfgidx == 0 && !ifp->drvr->android->deinit) {
+		brcmf_dbg(INFO, "skip removing primary interface\n");
+		return;
+	}
+#endif
 	if (ifp->ndev) {
 		if (bsscfgidx == 0) {
-			if (ifp->ndev->netdev_ops == &brcmf_netdev_ops_pri) {
+			if (ifp->ndev->netdev_ops == &brcmf_netdev_ops_pri &&
+			    drvr->android->wifi_on) {
 				rtnl_lock();
 				brcmf_netdev_stop(ifp->ndev);
 				rtnl_unlock();
@@ -769,6 +1003,10 @@ static void brcmf_del_if(struct brcmf_pub *drvr, s32 bsscfgidx,
 		brcmf_p2p_ifp_removed(ifp, rtnl_locked);
 		kfree(ifp);
 	}
+
+	drvr->iflist[bsscfgidx] = NULL;
+	if (drvr->if2bss[ifidx] == bsscfgidx)
+		drvr->if2bss[ifidx] = BRCMF_BSSIDX_INVALID;
 }
 
 void brcmf_remove_interface(struct brcmf_if *ifp, bool rtnl_locked)
@@ -778,36 +1016,41 @@ void brcmf_remove_interface(struct brcmf_if *ifp, bool rtnl_locked)
 	if (!ifp || WARN_ON(ifp->drvr->iflist[ifp->bsscfgidx] != ifp))
 		return;
 
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
-	if (ifp->bsscfgidx == 0)
+	drvr = ifp->drvr;
+
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+	if (ifp->bsscfgidx == 0 && !ifp->drvr->android->deinit)
 		return;
-#endif
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
 
 	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d, ifidx=%d\n", ifp->bsscfgidx,
 		  ifp->ifidx);
 
-	drvr = ifp->drvr;
-
+#ifdef CPTCFG_BRCMFMAC_ANDROID
 	mutex_lock(&drvr->net_if_lock);
-	brcmf_proto_del_if(drvr, ifp);
-	brcmf_del_if(drvr, ifp->bsscfgidx, rtnl_locked);
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
+	brcmf_proto_del_if(ifp->drvr, ifp);
+	brcmf_del_if(ifp->drvr, ifp->bsscfgidx, rtnl_locked);
+#ifdef CPTCFG_BRCMFMAC_ANDROID
 	mutex_unlock(&drvr->net_if_lock);
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
 }
 
 static int brcmf_psm_watchdog_notify(struct brcmf_if *ifp,
 				     const struct brcmf_event_msg *evtmsg,
 				     void *data)
 {
+	struct brcmf_pub *drvr = ifp->drvr;
 	int err;
 
 	brcmf_dbg(TRACE, "enter: bsscfgidx=%d\n", ifp->bsscfgidx);
 
-	brcmf_err("PSM's watchdog has fired!\n");
+	bphy_err(drvr, "PSM's watchdog has fired!\n");
 
 	err = brcmf_debug_create_memdump(ifp->drvr->bus_if, data,
 					 evtmsg->datalen);
 	if (err)
-		brcmf_err("Failed to get memory dump, %d\n", err);
+		bphy_err(drvr, "Failed to get memory dump, %d\n", err);
 
 	return err;
 }
@@ -851,7 +1094,7 @@ static int brcmf_inetaddr_changed(struct notifier_block *nb,
 	ret = brcmf_fil_iovar_data_get(ifp, "arp_hostip", addr_table,
 				       sizeof(addr_table));
 	if (ret) {
-		brcmf_err("fail to get arp ip table err:%d\n", ret);
+		bphy_err(drvr, "fail to get arp ip table err:%d\n", ret);
 		return NOTIFY_OK;
 	}
 
@@ -868,7 +1111,7 @@ static int brcmf_inetaddr_changed(struct notifier_block *nb,
 			ret = brcmf_fil_iovar_data_set(ifp, "arp_hostip",
 				&ifa->ifa_address, sizeof(ifa->ifa_address));
 			if (ret)
-				brcmf_err("add arp ip err %d\n", ret);
+				bphy_err(drvr, "add arp ip err %d\n", ret);
 		}
 		break;
 	case NETDEV_DOWN:
@@ -880,8 +1123,8 @@ static int brcmf_inetaddr_changed(struct notifier_block *nb,
 			ret = brcmf_fil_iovar_data_set(ifp, "arp_hostip_clear",
 						       NULL, 0);
 			if (ret) {
-				brcmf_err("fail to clear arp ip table err:%d\n",
-					  ret);
+				bphy_err(drvr, "fail to clear arp ip table err:%d\n",
+					 ret);
 				return NOTIFY_OK;
 			}
 			for (i = 0; i < ARPOL_MAX_ENTRIES; i++) {
@@ -891,8 +1134,8 @@ static int brcmf_inetaddr_changed(struct notifier_block *nb,
 							       &addr_table[i],
 							       sizeof(addr_table[i]));
 				if (ret)
-					brcmf_err("add arp ip err %d\n",
-						  ret);
+					bphy_err(drvr, "add arp ip err %d\n",
+						 ret);
 			}
 		}
 		break;
@@ -957,73 +1200,12 @@ static int brcmf_inet6addr_changed(struct notifier_block *nb,
 }
 #endif
 
-int brcmf_attach(struct device *dev, struct brcmf_mp_device *settings)
+int brcmf_fwlog_attach(struct device *dev)
 {
-	struct brcmf_pub *drvr = NULL;
-	int ret = 0;
-	int i;
+	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
+	struct brcmf_pub *drvr = bus_if->drvr;
 
-	brcmf_dbg(TRACE, "Enter\n");
-
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
-	if (g_drvr)
-		drvr = g_drvr;
-	if (!drvr)
-#endif
-	{
-		drvr = kzalloc(sizeof(*drvr), GFP_ATOMIC);
-		if (!drvr)
-			return -ENOMEM;
-
-		for (i = 0; i < ARRAY_SIZE(drvr->if2bss); i++)
-			drvr->if2bss[i] = BRCMF_BSSIDX_INVALID;
-
-		mutex_init(&drvr->proto_block);
-		mutex_init(&drvr->net_if_lock);
-#ifdef CPTCFG_BRCMFMAC_ANDROID
-		/* Attach Android module */
-		ret = brcmf_android_attach(drvr);
-		if (ret)
-			goto fail;
-#endif
-	}
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
-	/* Initialize pkt filter list */
-	for (i = 0; i < MAX_PKT_FILTER_COUNT; ++i) {
-		drvr->pkt_filter[i].id = 0;
-		drvr->pkt_filter[i].enable = 0;
-	}
-#endif
-
-	/* Link to bus module */
-	drvr->hdrlen = 0;
-	drvr->bus_if = dev_get_drvdata(dev);
-	drvr->bus_if->drvr = drvr;
-	drvr->settings = settings;
-
-	/* attach debug facilities */
-	brcmf_debug_attach(drvr);
-
-	/* Attach and link in the protocol */
-	ret = brcmf_proto_attach(drvr);
-	if (ret != 0) {
-		brcmf_err("brcmf_prot_attach failed\n");
-		goto fail;
-	}
-
-	/* Attach to events important for core code */
-	brcmf_fweh_register(drvr, BRCMF_E_PSM_WATCHDOG,
-			    brcmf_psm_watchdog_notify);
-
-	/* attach firmware event handler */
-	brcmf_fweh_attach(drvr);
-
-	return ret;
-
-fail:
-	brcmf_detach(dev);
-
-	return ret;
+	return brcmf_debug_fwlog_init(drvr);
 }
 
 static int brcmf_revinfo_read(struct seq_file *s, void *data)
@@ -1036,8 +1218,7 @@ static int brcmf_revinfo_read(struct seq_file *s, void *data)
 	seq_printf(s, "vendorid: 0x%04x\n", ri->vendorid);
 	seq_printf(s, "deviceid: 0x%04x\n", ri->deviceid);
 	seq_printf(s, "radiorev: %s\n", brcmu_dotrev_str(ri->radiorev, drev));
-	seq_printf(s, "chipnum: %u (%x)\n", ri->chipnum, ri->chipnum);
-	seq_printf(s, "chiprev: %u\n", ri->chiprev);
+	seq_printf(s, "chip: %s\n", ri->chipname);
 	seq_printf(s, "chippkg: %u\n", ri->chippkg);
 	seq_printf(s, "corerev: %u\n", ri->corerev);
 	seq_printf(s, "boardid: 0x%04x\n", ri->boardid);
@@ -1056,18 +1237,51 @@ static int brcmf_revinfo_read(struct seq_file *s, void *data)
 	return 0;
 }
 
-int brcmf_bus_started(struct device *dev)
+static void brcmf_core_bus_reset(struct work_struct *work)
+{
+	struct brcmf_pub *drvr = container_of(work, struct brcmf_pub,
+					      bus_reset);
+#if defined(CPTCFG_BRCMFMAC_ANDROID)
+	brcmf_android_set_reset(drvr, true);
+#endif
+	brcmf_bus_reset(drvr->bus_if);
+}
+
+static ssize_t bus_reset_write(struct file *file, const char __user *user_buf,
+			       size_t count, loff_t *ppos)
+{
+	struct brcmf_pub *drvr = file->private_data;
+	u8 value;
+
+	if (kstrtou8_from_user(user_buf, count, 0, &value))
+		return -EINVAL;
+
+	if (value != 1)
+		return -EINVAL;
+
+	schedule_work(&drvr->bus_reset);
+
+	return count;
+}
+
+static const struct file_operations bus_reset_fops = {
+	.open	= simple_open,
+	.llseek	= no_llseek,
+	.write	= bus_reset_write,
+};
+
+static int brcmf_bus_started(struct brcmf_pub *drvr, struct cfg80211_ops *ops)
 {
 	int ret = -1;
-	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
-	struct brcmf_pub *drvr = bus_if->drvr;
+	struct brcmf_bus *bus_if = drvr->bus_if;
 	struct brcmf_if *ifp;
 	struct brcmf_if *p2p_ifp;
+	struct brcmf_cfg80211_info *cfg;
 
 	brcmf_dbg(TRACE, "\n");
 
 	/* add primary networking interface */
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
+#ifdef CPTCFG_BRCMFMAC_ANDROID
 	ifp = drvr->iflist[0];
 #else
 	ifp = brcmf_add_if(drvr, 0, 0, false, "wlan%d", NULL);
@@ -1080,20 +1294,16 @@ int brcmf_bus_started(struct device *dev)
 	/* signal bus ready */
 	brcmf_bus_change_state(bus_if, BRCMF_BUS_UP);
 
+	/* do bus specific preinit here */
+	ret = brcmf_bus_preinit(bus_if);
+	if (ret < 0)
+		goto fail;
+
 	/* Bus is ready, do any initialization */
 	ret = brcmf_c_preinit_dcmds(ifp);
 	if (ret < 0)
 		goto fail;
 
-	brcmf_debugfs_add_entry(drvr, "revinfo", brcmf_revinfo_read);
-
-	/* assure we have chipid before feature attach */
-	if (!bus_if->chip) {
-		bus_if->chip = drvr->revinfo.chipnum;
-		bus_if->chiprev = drvr->revinfo.chiprev;
-		brcmf_dbg(INFO, "firmware revinfo: chip %x (%d) rev %d\n",
-			  bus_if->chip, bus_if->chip, bus_if->chiprev);
-	}
 	brcmf_feat_attach(drvr);
 
 	ret = brcmf_proto_init_done(drvr);
@@ -1102,20 +1312,24 @@ int brcmf_bus_started(struct device *dev)
 
 	brcmf_proto_add_if(drvr, ifp);
 
-	drvr->config = brcmf_cfg80211_attach(drvr, bus_if->dev,
-					     drvr->settings->p2p_enable);
-	if (drvr->config == NULL) {
+	cfg = brcmf_cfg80211_attach(drvr, ops,
+				    drvr->settings->p2p_enable);
+	if (!cfg) {
 		ret = -ENOMEM;
 		goto fail;
 	}
+	drvr->config = cfg;
 
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+	brcmf_dbg(INFO, "set mac address %pM\n", ifp->mac_addr);
 	memcpy(ifp->ndev->dev_addr, ifp->mac_addr, ETH_ALEN);
+	memcpy(ifp->ndev->perm_addr, ifp->mac_addr, ETH_ALEN);
+	brcmf_android_restore_pktfilter(drvr);
 #else
 	ret = brcmf_net_attach(ifp, false);
 #endif
 
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
+#ifdef CPTCFG_BRCMFMAC_ANDROID
 	if (!brcmf_android_in_reset(drvr))
 #endif
 	{
@@ -1145,21 +1359,128 @@ int brcmf_bus_started(struct device *dev)
 #endif
 #endif /* CONFIG_INET */
 
+	INIT_WORK(&drvr->bus_reset, brcmf_core_bus_reset);
+
+	/* populate debugfs */
+	brcmf_debugfs_add_entry(drvr, "revinfo", brcmf_revinfo_read);
+	debugfs_create_file("reset", 0600, brcmf_debugfs_get_devdir(drvr), drvr,
+			    &bus_reset_fops);
+	brcmf_feat_debugfs_create(drvr);
+	brcmf_proto_debugfs_create(drvr);
+	brcmf_bus_debugfs_create(bus_if);
+
+	brcmf_ap_add_vif(drvr->wiphy, "wlan1", NULL);
+
 	return 0;
 
 fail:
-	brcmf_err("failed: %d\n", ret);
-	if (drvr->config) {
+	bphy_err(drvr, "failed: %d\n", ret);
+	if (drvr->config)
 		brcmf_cfg80211_detach(drvr->config);
-		drvr->config = NULL;
-	}
+#ifndef CPTCFG_BRCMFMAC_ANDROID
+	drvr->config = NULL;
 	brcmf_net_detach(ifp->ndev, false);
+	drvr->iflist[0] = NULL;
+#endif
 	if (p2p_ifp)
 		brcmf_net_detach(p2p_ifp->ndev, false);
-	drvr->iflist[0] = NULL;
 	drvr->iflist[1] = NULL;
 	if (drvr->settings->ignore_probe_fail)
 		ret = 0;
+
+	return ret;
+}
+
+int brcmf_alloc(struct device *dev, struct brcmf_mp_device *settings)
+{
+
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+	struct brcmf_pub *drvr = g_drvr;
+#else
+	struct brcmf_pub *drvr;
+	struct wiphy *wiphy;
+	struct cfg80211_ops *ops;
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
+
+	brcmf_dbg(TRACE, "Enter\n");
+
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+	set_wiphy_dev(drvr->wiphy, dev);
+#else
+	ops = brcmf_cfg80211_get_ops(settings);
+	if (!ops)
+		return -ENOMEM;
+
+	wiphy = wiphy_new(ops, sizeof(*drvr));
+	if (!wiphy) {
+		kfree(ops);
+		return -ENOMEM;
+	}
+
+	set_wiphy_dev(wiphy, dev);
+	drvr = wiphy_priv(wiphy);
+	drvr->wiphy = wiphy;
+	drvr->ops = ops;
+#endif
+	drvr->bus_if = dev_get_drvdata(dev);
+	drvr->bus_if->drvr = drvr;
+	drvr->settings = settings;
+
+	return 0;
+}
+
+int brcmf_attach(struct device *dev, bool start_bus)
+{
+	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
+	struct brcmf_pub *drvr = bus_if->drvr;
+	int ret = 0;
+	int i;
+
+	brcmf_dbg(TRACE, "Enter\n");
+
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+	i = 1;
+#else
+	i = 0;
+#endif
+	for (; i < ARRAY_SIZE(drvr->if2bss); i++)
+		drvr->if2bss[i] = BRCMF_BSSIDX_INVALID;
+
+	mutex_init(&drvr->proto_block);
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+	mutex_init(&drvr->net_if_lock);
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
+
+	/* Link to bus module */
+	drvr->hdrlen = 0;
+
+	/* Attach and link in the protocol */
+	ret = brcmf_proto_attach(drvr);
+	if (ret != 0) {
+		bphy_err(drvr, "brcmf_prot_attach failed\n");
+		goto fail;
+	}
+
+	/* Attach to events important for core code */
+	brcmf_fweh_register(drvr, BRCMF_E_PSM_WATCHDOG,
+			    brcmf_psm_watchdog_notify);
+
+	/* attach firmware event handler */
+	brcmf_fweh_attach(drvr);
+
+	if (start_bus) {
+		ret = brcmf_bus_started(drvr, drvr->ops);
+		if (ret != 0) {
+			bphy_err(drvr, "dongle is not responding: err=%d\n",
+				 ret);
+			goto fail;
+		}
+	}
+
+	return 0;
+
+fail:
+	brcmf_detach(dev);
 
 	return ret;
 }
@@ -1186,6 +1507,26 @@ void brcmf_dev_reset(struct device *dev)
 		brcmf_fil_cmd_int_set(drvr->iflist[0], BRCMF_C_TERMINATED, 1);
 }
 
+void brcmf_dev_coredump(struct device *dev)
+{
+	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
+
+	if (brcmf_debug_create_memdump(bus_if, NULL, 0) < 0)
+		brcmf_dbg(TRACE, "failed to create coredump\n");
+}
+
+void brcmf_fw_crashed(struct device *dev)
+{
+	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
+	struct brcmf_pub *drvr = bus_if->drvr;
+
+	bphy_err(drvr, "Firmware has halted or crashed\n");
+
+	brcmf_dev_coredump(dev);
+
+	schedule_work(&drvr->bus_reset);
+}
+
 void brcmf_detach(struct device *dev)
 {
 	s32 i;
@@ -1205,31 +1546,52 @@ void brcmf_detach(struct device *dev)
 	unregister_inet6addr_notifier(&drvr->inet6addr_notifier);
 #endif
 
-	/* stop firmware event handling */
-	brcmf_fweh_detach(drvr);
-	if (drvr->config)
-		brcmf_p2p_detach(&drvr->config->p2p);
-
+#ifdef CPTCFG_BRCMFMAC_ANDROID
 	brcmf_bus_change_state(bus_if, BRCMF_BUS_DOWN);
-
-	/* make sure primary interface removed last */
-	for (i = BRCMF_MAX_IFS - 1; i > -1; i--)
-		brcmf_remove_interface(drvr->iflist[i], false);
-
-	brcmf_cfg80211_detach(drvr->config);
-
-	brcmf_bus_stop(drvr->bus_if);
-
-	brcmf_proto_detach(drvr);
-
-	brcmf_debug_detach(drvr);
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
-	brcmf_dbg(INFO, "not do detach android module\n");
+	if (brcmf_android_is_inited(drvr)) {
+		brcmf_bus_stop(bus_if);
+		brcmf_fweh_detach(drvr);
+		brcmf_proto_detach(drvr);
+	}
 #else
-	brcmf_android_detach(drvr);
 	bus_if->drvr = NULL;
 	kfree(drvr);
 #endif
+
+	if (drvr->mon_if) {
+		brcmf_net_detach(drvr->mon_if->ndev, false);
+		drvr->mon_if = NULL;
+	}
+
+	brcmf_err("remove interfaces\n");
+	/* make sure primary interface removed last */
+	for (i = BRCMF_MAX_IFS - 1; i > -1; i--) {
+		if (drvr->iflist[i])
+			brcmf_del_if(drvr, drvr->iflist[i]->bsscfgidx, true);
+	}
+
+	if (drvr->config) {
+		brcmf_p2p_detach(&drvr->config->p2p);
+		brcmf_cfg80211_detach(drvr->config);
+#ifndef CPTCFG_BRCMFMAC_ANDROID
+		drvr->config = NULL;
+#endif
+	}
+}
+
+void brcmf_free(struct device *dev)
+{
+	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
+	struct brcmf_pub *drvr = bus_if->drvr;
+
+	if (!drvr)
+		return;
+
+	bus_if->drvr = NULL;
+
+	kfree(drvr->ops);
+
+	wiphy_free(drvr->wiphy);
 }
 
 s32 brcmf_iovar_data_set(struct device *dev, char *name, void *data, u32 len)
@@ -1247,14 +1609,17 @@ static int brcmf_get_pend_8021x_cnt(struct brcmf_if *ifp)
 
 int brcmf_netdev_wait_pend8021x(struct brcmf_if *ifp)
 {
+	struct brcmf_pub *drvr = ifp->drvr;
 	int err;
 
 	err = wait_event_timeout(ifp->pend_8021x_wait,
 				 !brcmf_get_pend_8021x_cnt(ifp),
 				 MAX_WAIT_FOR_8021X_TX);
 
-	if (!err)
-		brcmf_err("Timed out waiting for no pending 802.1x packets\n");
+	if (!err) {
+		bphy_err(drvr, "Timed out waiting for no pending 802.1x packets\n");
+		atomic_set(&ifp->pend_8021x_cnt, 0);
+	}
 
 	return !err;
 }
@@ -1266,6 +1631,12 @@ void brcmf_bus_change_state(struct brcmf_bus *bus, enum brcmf_bus_state state)
 	int ifidx;
 
 	brcmf_dbg(TRACE, "%d -> %d\n", bus->state, state);
+
+	if (!drvr) {
+		brcmf_dbg(INFO, "ignoring transition, bus not attached yet\n");
+		return;
+	}
+
 	bus->state = state;
 
 	if (state == BRCMF_BUS_UP) {
@@ -1304,6 +1675,7 @@ int __init brcmf_core_init(void)
 
 void __exit brcmf_core_exit(void)
 {
+	brcmf_dbg(INFO, "start removing module\n");
 	cancel_work_sync(&brcmf_driver_work);
 
 #ifdef CPTCFG_BRCMFMAC_SDIO
@@ -1313,8 +1685,21 @@ void __exit brcmf_core_exit(void)
 	brcmf_usb_exit();
 #endif
 #ifdef CPTCFG_BRCMFMAC_PCIE
+#ifndef CPTCFG_BRCMFMAC_ANDROID
 	brcmf_pcie_exit();
 #endif
+#endif
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+	if (!g_drvr)
+		return;
+
+	g_drvr->android->deinit = true;
+	brcmf_remove_interface(g_drvr->iflist[0], false);
+	brcmf_cfg80211_detach(g_drvr->config);
+	kfree(g_drvr->ops);
+	wiphy_free(g_drvr->wiphy);
+	brcmf_android_detach(g_drvr);
+#endif /* CPTCFG_BRCMFMAC_ANDROID */
 }
 
 int
@@ -1440,9 +1825,14 @@ brcmf_pktfilter_add_remove(struct net_device *ndev, int filter_num, bool add)
 		  pkt_filter->u.pattern.size_bytes * 2;
 
 	if (add) {
+		/* Delete existing ID */
+		brcmf_fil_iovar_int_set(ifp, "pkt_filter_delete",
+					pkt_filter->id);
 		/* Add filter */
+		ifp->fwil_fwerr = true;
 		ret = brcmf_fil_iovar_data_set(ifp, "pkt_filter_add",
 					       pkt_filter, buflen);
+		ifp->fwil_fwerr = false;
 		if (ret)
 			goto failed;
 		drvr->pkt_filter[filter_num].id = pkt_filter->id;
@@ -1450,16 +1840,17 @@ brcmf_pktfilter_add_remove(struct net_device *ndev, int filter_num, bool add)
 
 	} else {
 		/* Delete filter */
+		ifp->fwil_fwerr = true;
 		ret = brcmf_fil_iovar_int_set(ifp, "pkt_filter_delete",
 					      pkt_filter->id);
-		if (ret == -ENOENT)
+		ifp->fwil_fwerr = false;
+		if (ret == -BRCMF_FW_BADARG)
 			ret = 0;
 		if (ret)
 			goto failed;
 
 		drvr->pkt_filter[filter_num].id = 0;
 		drvr->pkt_filter[filter_num].enable  = 0;
-
 	}
 failed:
 	if (ret)
@@ -1493,16 +1884,237 @@ int brcmf_pktfilter_enable(struct net_device *ndev, bool enable)
 	return ret;
 }
 
+/** Find STA with MAC address ea in an interface's STA list. */
+struct brcmf_sta *
+brcmf_find_sta(struct brcmf_if *ifp, const u8 *ea)
+{
+	struct brcmf_sta  *sta;
+	unsigned long flags;
+
+	BRCMF_IF_STA_LIST_LOCK(ifp, flags);
+	list_for_each_entry(sta, &ifp->sta_list, list) {
+		if (!memcmp(sta->ea.octet, ea, ETH_ALEN)) {
+			brcmf_dbg(INFO, "Found STA: 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x into sta list\n",
+				  sta->ea.octet[0], sta->ea.octet[1],
+				  sta->ea.octet[2], sta->ea.octet[3],
+				  sta->ea.octet[4], sta->ea.octet[5]);
+			BRCMF_IF_STA_LIST_UNLOCK(ifp, flags);
+			return sta;
+		}
+	}
+	BRCMF_IF_STA_LIST_UNLOCK(ifp, flags);
+
+	return BRCMF_STA_NULL;
+}
+
+/** Add STA into the interface's STA list. */
+struct brcmf_sta *
+brcmf_add_sta(struct brcmf_if *ifp, const u8 *ea)
+{
+	struct brcmf_sta *sta;
+	unsigned long flags;
+
+	sta =  kzalloc(sizeof(*sta), GFP_KERNEL);
+	if (sta == BRCMF_STA_NULL) {
+		brcmf_err("Alloc failed\n");
+		return BRCMF_STA_NULL;
+	}
+	memcpy(sta->ea.octet, ea, ETH_ALEN);
+	brcmf_dbg(INFO, "Add STA: 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x into sta list\n",
+		  sta->ea.octet[0], sta->ea.octet[1],
+		  sta->ea.octet[2], sta->ea.octet[3],
+		  sta->ea.octet[4], sta->ea.octet[5]);
+
+	/* link the sta and the dhd interface */
+	sta->ifp = ifp;
+	INIT_LIST_HEAD(&sta->list);
+
+	BRCMF_IF_STA_LIST_LOCK(ifp, flags);
+
+	list_add_tail(&sta->list, &ifp->sta_list);
+
+	BRCMF_IF_STA_LIST_UNLOCK(ifp, flags);
+	return sta;
+}
+
+/** Delete STA from the interface's STA list. */
+void
+brcmf_del_sta(struct brcmf_if *ifp, const u8 *ea)
+{
+	struct brcmf_sta *sta, *next;
+	unsigned long flags;
+
+	BRCMF_IF_STA_LIST_LOCK(ifp, flags);
+	list_for_each_entry_safe(sta, next, &ifp->sta_list, list) {
+		if (!memcmp(sta->ea.octet, ea, ETH_ALEN)) {
+			brcmf_dbg(INFO, "del STA: 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x from sta list\n",
+				  ea[0], ea[1], ea[2], ea[3],
+				  ea[4], ea[5]);
+			list_del(&sta->list);
+			kfree(sta);
+		}
+	}
+
+	BRCMF_IF_STA_LIST_UNLOCK(ifp, flags);
+}
+
+/** Add STA if it doesn't exist. Not reentrant. */
+struct brcmf_sta*
+brcmf_findadd_sta(struct brcmf_if *ifp, const u8 *ea)
+{
+	struct brcmf_sta *sta = NULL;
+
+	sta = brcmf_find_sta(ifp, ea);
+
+	if (!sta) {
+		/* Add entry */
+		sta = brcmf_add_sta(ifp, ea);
+	}
+	return sta;
+}
+
+int
+brcmf_set_country(struct net_device *ndev, char *country)
+{
+	struct wireless_dev *wdev = ndev->ieee80211_ptr;
+	struct wiphy *wiphy = NULL;
+	struct brcmf_if *ifp = NULL;
+	struct brcmf_fil_country_le ccreq;
+	int err;
+
+	brcmf_dbg(TRACE, "set country: %s\n", country);
+
+	if (!wdev)
+		return -ENODEV;
+
+	wiphy = wdev->wiphy;
+	ifp = netdev_priv(ndev);
+
+	if (strlen(country) != 2)
+		return -EINVAL;
+
+	ccreq.country_abbrev[0] = country[0];
+	ccreq.country_abbrev[1] = country[1];
+	ccreq.country_abbrev[2] = 0;
+	ccreq.ccode[0] = country[0];
+	ccreq.ccode[1] = country[1];
+	ccreq.ccode[2] = 0;
+	ccreq.rev = -1;
+
+	brcmf_dbg(INFO, "set country: %s\n", country);
+	err = brcmf_fil_iovar_data_set(ifp, "country", &ccreq, sizeof(ccreq));
+	if (err) {
+		brcmf_err("Firmware rejected country setting\n");
+		return -EINVAL;
+	}
+
+	brcmf_setup_wiphybands(wiphy_to_cfg(wiphy));
+	return 0;
+}
+
+#ifdef CPTCFG_BRCMFMAC_ANDROID
+static
+int brcmf_android_ioctl_entry(struct net_device *net, struct ifreq *ifr,
+			      int cmd)
+{
+	struct brcmf_if *ifp = netdev_priv(net);
+	int ret = -EOPNOTSUPP;
+
+	brcmf_android_wake_lock(ifp->drvr);
+
+	if (brcmf_android_is_attached(ifp->drvr)) {
+		if (cmd == SIOCDEVPRIVATE + 1)
+			ret = brcmf_android_priv_cmd(net, ifr, cmd);
+	}
+
+	brcmf_android_wake_unlock(ifp->drvr);
+
+	return ret;
+}
+
+int brcmf_android_priv_cmd(struct net_device *ndev, struct ifreq *ifr, int cmd)
+{
+	struct brcmf_if *ifp = netdev_priv(ndev);
+	int ret = 0;
+	char *command = NULL;
+	int bytes_written = 0;
+	struct brcmf_android_wifi_priv_cmd priv_cmd;
+
+	if (copy_from_user(&priv_cmd, ifr->ifr_data,
+			   sizeof(struct brcmf_android_wifi_priv_cmd))) {
+		ret = -EFAULT;
+		goto exit;
+	}
+
+	if (priv_cmd.total_len > PRIVATE_COMMAND_MAX_LEN ||
+	    priv_cmd.total_len < 0) {
+		brcmf_err("too long priavte command\n");
+		ret = -EINVAL;
+		goto exit;
+	}
+	command = kmalloc((priv_cmd.total_len + 1), GFP_KERNEL);
+	if (!command) {
+		ret = -ENOMEM;
+		goto exit;
+	}
+	if (copy_from_user(command, priv_cmd.buf, priv_cmd.total_len)) {
+		ret = -EFAULT;
+		goto exit;
+	}
+
+	command[priv_cmd.total_len] = '\0';
+
+	brcmf_dbg(INFO, "Android private cmd \"%s\" on %s\n",
+		  command, ifr->ifr_name);
+
+	bytes_written = brcmf_handle_private_cmd(ifp->drvr, ndev, command,
+						 priv_cmd.total_len);
+
+	if (bytes_written >= 0) {
+		if (bytes_written == 0 && priv_cmd.total_len > 0)
+			command[0] = '\0';
+		if (bytes_written >= priv_cmd.total_len) {
+			brcmf_err("bytes_written = %d\n", bytes_written);
+			bytes_written = priv_cmd.total_len;
+		} else {
+			bytes_written++;
+		}
+		priv_cmd.used_len = bytes_written;
+		if (copy_to_user(priv_cmd.buf, command, bytes_written)) {
+			brcmf_err("failed to copy data to user buffer\n");
+			ret = -EFAULT;
+		}
+	} else {
+		ret = bytes_written;
+	}
+
+exit:
+	kfree(command);
+	return ret;
+}
+
 static struct brcmfmac_platform_data *brcmfmac_pdata;
 
 int brcmf_set_power(bool on, unsigned long msec)
 {
 	brcmf_dbg(TRACE, "power %s\n", (on ? "on" : "off"));
 
-	if (on && brcmfmac_pdata && brcmfmac_pdata->power_on) {
-		brcmfmac_pdata->power_on();
-	} else if (!on && brcmfmac_pdata && brcmfmac_pdata->power_off) {
-		brcmfmac_pdata->power_off();
+	if (brcmfmac_pdata) {
+		if (on) {
+			if (brcmfmac_pdata->power_on) {
+				brcmfmac_pdata->power_on();
+			} else {
+				brcmf_err("Platform doesn't support power on\n");
+				return -EIO;
+			}
+		} else {
+			if (brcmfmac_pdata->power_off) {
+				brcmfmac_pdata->power_off();
+			} else {
+				brcmf_err("Platform doesn't support power off\n");
+				return -EIO;
+			}
+		}
 	} else {
 		if (!wifi_regulator) {
 			brcmf_err("cannot get wifi regulator\n");
@@ -1515,14 +2127,14 @@ int brcmf_set_power(bool on, unsigned long msec)
 				return -EIO;
 			}
 			msleep(msec);
-#ifdef CPTCFG_BRCMFMAC_SDIO
+#if defined(CPTCFG_BRCMFMAC_SDIO) && defined(CPTCFG_BRCMFMAC_CARD_DETECT)
 			wifi_card_detect(true);
 #endif
 #ifdef CPTCFG_BRCMFMAC_PCIE
 			brcmf_pcie_register();
 #endif
 		} else {
-#ifdef CPTCFG_BRCMFMAC_SDIO
+#if defined(CPTCFG_BRCMFMAC_SDIO) && defined(CPTCFG_BRCMFMAC_CARD_DETECT)
 			wifi_card_detect(false);
 #endif
 #ifdef CPTCFG_BRCMFMAC_PCIE
@@ -1541,23 +2153,22 @@ int brcmf_android_netdev_open(struct net_device *ndev)
 {
 	struct brcmf_if *ifp = netdev_priv(ndev);
 	struct brcmf_pub *drvr = ifp->drvr;
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
 	struct brcmf_bus *bus_if = drvr->bus_if;
 	struct brcmf_android *android = drvr->android;
 	u32 timeout;
-#endif
 	int ret = 0;
 
+	brcmf_dbg(INFO, "Opening IF:%s\n", ndev->name);
 	brcmf_android_wake_lock(drvr);
 
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
-	if (ifp->bsscfgidx == 0) {
+	if (android->enabled_ndev_num == 0) {
 		if (brcmf_android_wifi_is_on(drvr)) {
 			brcmf_err("android wifi is on already\n");
 			ret = -EAGAIN;
 			goto failed;
 		}
 
+		android->reset_status = RS_INIT;
 		if (brcmf_android_wifi_on(drvr, ndev)) {
 			brcmf_err("brcmf_android_wifi_on failed\n");
 			ret = -EIO;
@@ -1565,13 +2176,14 @@ int brcmf_android_netdev_open(struct net_device *ndev)
 		}
 
 		if (brcmf_android_in_reset(drvr))
-			brcmf_dbg(ANDROID, "device reset, wait for bus ready");
+			brcmf_dbg(INFO, "device reset, wait for bus ready");
 
 		timeout = wait_event_timeout(ifp->pend_dev_reset_wait,
-					     !brcmf_android_in_reset(drvr),
+					     (android->reset_status != RS_INIT),
 					     MAX_WAIT_FOR_BUS_START);
 
-		if (timeout && android->init_done && !android->reset_status) {
+		if (timeout && android->init_done &&
+		    android->reset_status == RS_OK) {
 			bus_if = drvr->bus_if;
 		} else {
 			brcmf_err("device reset failed\n");
@@ -1586,8 +2198,9 @@ failed:
 		brcmf_android_wake_unlock(drvr);
 		return ret;
 	}
-#endif
 	ret = brcmf_netdev_open(ndev);
+	if (!ret)
+		android->enabled_ndev_num++;
 
 	brcmf_android_wake_unlock(drvr);
 
@@ -1599,40 +2212,27 @@ int brcmf_android_netdev_stop(struct net_device *ndev)
 {
 	struct brcmf_if *ifp = netdev_priv(ndev);
 	struct brcmf_pub *drvr = ifp->drvr;
+	struct brcmf_android *android = drvr->android;
 	int ret;
+
+	brcmf_dbg(INFO, "Stopping IF:%s\n", ndev->name);
+
+	if (!drvr->android->wifi_on)
+		return 0;
 
 	brcmf_android_wake_lock(drvr);
 
 	ret = brcmf_netdev_stop(ndev);
+	if (!ret)
+		android->enabled_ndev_num--;
 
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
-	if (ifp->bsscfgidx == 0) {
+	if (android->enabled_ndev_num == 0) {
 		brcmf_android_wifi_off(ifp->drvr, ndev);
 		brcmf_android_set_reset(ifp->drvr, true);
 		g_drvr = ifp->drvr;
 	}
-#endif
 
 	brcmf_android_wake_unlock(drvr);
-
-	return ret;
-}
-
-static
-int brcmf_android_ioctl_entry(struct net_device *net, struct ifreq *ifr,
-			      int cmd)
-{
-	struct brcmf_if *ifp = netdev_priv(net);
-	int ret = -EOPNOTSUPP;
-
-	brcmf_android_wake_lock(ifp->drvr);
-
-	if (brcmf_android_is_attached(ifp->drvr)) {
-		if (cmd == SIOCDEVPRIVATE + 1)
-			ret = brcmf_android_priv_cmd(net, ifr, cmd);
-	}
-
-	brcmf_android_wake_unlock(ifp->drvr);
 
 	return ret;
 }
@@ -1714,117 +2314,21 @@ netdev_tx_t brcmf_android_net_p2p_start_xmit(struct sk_buff *skb,
 	return ret;
 }
 
-int
-brcmf_set_country(struct net_device *ndev, char *country)
-{
-	struct wireless_dev *wdev = ndev->ieee80211_ptr;
-	struct wiphy *wiphy = NULL;
-	struct brcmf_if *ifp = NULL;
-	struct brcmf_fil_country_le ccreq;
-	int err;
-
-	brcmf_dbg(TRACE, "set country: %s\n", country);
-
-	if (!wdev)
-		return -ENODEV;
-
-	wiphy = wdev->wiphy;
-	ifp = netdev_priv(ndev);
-
-	if (strlen(country) != 2)
-		return -EINVAL;
-
-	ccreq.country_abbrev[0] = country[0];
-	ccreq.country_abbrev[1] = country[1];
-	ccreq.country_abbrev[2] = 0;
-	ccreq.ccode[0] = country[0];
-	ccreq.ccode[1] = country[1];
-	ccreq.ccode[2] = 0;
-	ccreq.rev = -1;
-
-	brcmf_dbg(INFO, "set country: %s\n", country);
-	err = brcmf_fil_iovar_data_set(ifp, "country", &ccreq, sizeof(ccreq));
-	if (err) {
-		brcmf_err("Firmware rejected country setting\n");
-		return -EINVAL;
-	}
-
-	brcmf_setup_wiphybands(wiphy);
-	return 0;
-}
-
-int brcmf_android_priv_cmd(struct net_device *ndev, struct ifreq *ifr, int cmd)
-{
-	struct brcmf_if *ifp = netdev_priv(ndev);
-	int ret = 0;
-	char *command = NULL;
-	int bytes_written = 0;
-	struct brcmf_android_wifi_priv_cmd priv_cmd;
-
-	if (copy_from_user(&priv_cmd, ifr->ifr_data,
-			   sizeof(struct brcmf_android_wifi_priv_cmd))) {
-		ret = -EFAULT;
-		goto exit;
-	}
-
-	if (priv_cmd.total_len > PRIVATE_COMMAND_MAX_LEN ||
-	    priv_cmd.total_len < 0) {
-		brcmf_err("too long priavte command\n");
-		ret = -EINVAL;
-		goto exit;
-	}
-	command = kmalloc((priv_cmd.total_len + 1), GFP_KERNEL);
-	if (!command) {
-		ret = -ENOMEM;
-		goto exit;
-	}
-	if (copy_from_user(command, priv_cmd.buf, priv_cmd.total_len)) {
-		ret = -EFAULT;
-		goto exit;
-	}
-
-	command[priv_cmd.total_len] = '\0';
-
-	brcmf_dbg(INFO, "Android private cmd \"%s\" on %s\n",
-		  command, ifr->ifr_name);
-
-	bytes_written = brcmf_handle_private_cmd(ifp->drvr, ndev, command,
-						 priv_cmd.total_len);
-
-	if (bytes_written >= 0) {
-		if (bytes_written == 0 && priv_cmd.total_len > 0)
-			command[0] = '\0';
-		if (bytes_written >= priv_cmd.total_len) {
-			brcmf_err("bytes_written = %d\n", bytes_written);
-			bytes_written = priv_cmd.total_len;
-		} else {
-			bytes_written++;
-		}
-		priv_cmd.used_len = bytes_written;
-		if (copy_to_user(priv_cmd.buf, command, bytes_written)) {
-			brcmf_err("failed to copy data to user buffer\n");
-			ret = -EFAULT;
-		}
-	} else {
-		ret = bytes_written;
-	}
-
-exit:
-	kfree(command);
-	return ret;
-}
-
-#ifdef CPTCFG_BRCM_INSMOD_NO_FW
 void brcmf_wake_dev_reset_waitq(struct brcmf_pub *drvr, int status)
 {
 	struct brcmf_if *ifp = drvr->iflist[0];
 
-	drvr->android->reset_status = status;
+	if (status) {
+		brcmf_err("reset failed, err=%d\n", status);
+		drvr->android->reset_status = RS_FAILED;
+	} else {
+		brcmf_android_set_reset(drvr, false);
+		drvr->android->reset_status = RS_OK;
+	}
 	/* wake up device reset wait queue */
 	if (waitqueue_active(&ifp->pend_dev_reset_wait)) {
 		brcmf_dbg(INFO, "device reset is done, wake up pending task\n");
-		brcmf_android_set_reset(drvr, false);
 		wake_up(&ifp->pend_dev_reset_wait);
 	}
 }
-#endif
+#endif /* CPTCFG_BRCMFMAC_ANDROID */

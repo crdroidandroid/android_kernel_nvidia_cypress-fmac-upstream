@@ -1,17 +1,6 @@
+// SPDX-License-Identifier: ISC
 /*
  * Copyright (c) 2010 Broadcom Corporation
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
- * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
- * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
- * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -20,6 +9,7 @@
 #include <linux/module.h>
 
 #include <brcmu_utils.h>
+#include <linux/ctype.h>
 
 MODULE_AUTHOR("Broadcom Corporation");
 MODULE_DESCRIPTION("Broadcom 802.11n wireless LAN driver utilities.");
@@ -303,6 +293,32 @@ char *brcmu_dotrev_str(u32 dotrev, char *buf)
 	return buf;
 }
 EXPORT_SYMBOL(brcmu_dotrev_str);
+
+/* parse a xx:xx:xx:xx:xx:xx format ethernet address */
+int
+brcmu_ether_atoe(const char *p,  char *ea)
+{
+	int i = 0;
+	int value = 0;
+	int result = 0, last_result = 0;
+
+	for (i = 0; i < 6; i++) {
+		while (isxdigit(*p) && (value = isdigit(*p) ? *p - '0' :
+		__toupper(*p) - 'A' + 10) < 16) {
+			result = result * 16 + value;
+			/* Detected overflow */
+			last_result = result;
+			p++;
+		}
+		ea[i] = result;
+		p++;
+		result = 0;
+		last_result = 0;
+	}
+
+	return (i == 6);
+}
+EXPORT_SYMBOL(brcmu_ether_atoe);
 
 #if defined(DEBUG)
 /* pretty hex print a pkt buffer chain */

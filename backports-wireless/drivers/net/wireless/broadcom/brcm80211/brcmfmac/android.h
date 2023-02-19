@@ -1,5 +1,5 @@
-/*
- * Copyright 2017, Cypress Semiconductor Corporation or a subsidiary of
+/* SPDX-License-Identifier: ISC */
+/* Copyright 2017, Cypress Semiconductor Corporation or a subsidiary of
  * Cypress Semiconductor Corporation. All rights reserved.
  * This software, including source code, documentation and related
  * materials ("Software"), is owned by Cypress Semiconductor
@@ -33,10 +33,10 @@ extern struct brcmf_pub *g_drvr;
 
 int brcmf_android_wifi_off(struct brcmf_pub *drvr, struct net_device *dev);
 int brcmf_android_wifi_on(struct brcmf_pub *drvr, struct net_device *dev);
-int brcmf_android_attach(struct brcmf_pub *drvr);
+int brcmf_android_attach(struct device *dev, struct brcmf_mp_device *settings);
 int brcmf_android_detach(struct brcmf_pub *drvr);
 bool brcmf_android_is_attached(struct brcmf_pub *drvr);
-bool brcmf_android_is_built_in(struct brcmf_pub *drvr);
+bool brcmf_android_is_inited(struct brcmf_pub *drvr);
 bool brcmf_android_wifi_is_on(struct brcmf_pub *drvr);
 bool brcmf_android_in_reset(struct brcmf_pub *drvr);
 void brcmf_android_set_reset(struct brcmf_pub *drvr, bool is_reset);
@@ -47,14 +47,47 @@ void brcmf_android_wake_lock_waive(struct brcmf_pub *drvr, bool is_waive);
 bool brcmf_android_wake_lock_is_waive(struct brcmf_pub *drvr);
 int brcmf_handle_private_cmd(struct brcmf_pub *drvr, struct net_device *net,
 			     char *command, u32 cmd_len);
-int brcmf_android_init(struct brcmf_pub *drvr);
 int brcmf_android_reset_country(struct brcmf_pub *drvr);
 int brcmf_android_set_extra_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp);
+void brcmf_android_restore_pktfilter(struct brcmf_pub *drvr);
+void brcmf_android_set_wake_flag(struct brcmf_pub *drvr, int set);
+int brcmf_android_get_wake_flag(struct brcmf_pub *drvr);
+void brcmf_android_add_wake_event_cnts(struct brcmf_pub *drvr,
+				       enum brcmf_fweh_event_code code);
+void brcmf_android_add_wake_pkt_cnts(struct brcmf_pub *drvr,
+				     struct sk_buff *skb);
 
 struct brcmf_android_wifi_priv_cmd {
 	char *buf;
 	int used_len;
 	int total_len;
+};
+
+#define DOT11_OUI_LEN		3	/* d11 OUI length */
+
+#define RS_FAILED	(-1)
+#define RS_OK		(0)
+#define RS_INIT		(1)
+
+struct brcmf_andr_wake_counts {
+	u32 rcwake;
+	u32 rc_event[BRCMF_E_LAST];
+	u32 rxwake;
+	u32 rx_ucast;
+	u32 rx_mcast;
+	u32 rx_bcast;
+	u32 rx_arp;
+	u32 rx_icmpv6;
+	u32 rx_multi_ipv6;
+	u32 rx_multi_ipv4;
+	u32 rx_multi_other;
+	u32 rx_icmpv6_ra;
+	u32 rx_icmpv6_na;
+	u32 rx_icmpv6_ns;
+};
+
+struct brcmf_andr_wake_bus_info {
+	atomic_t pkt_wake;
 };
 
 struct brcmf_android {
@@ -64,12 +97,20 @@ struct brcmf_android {
 	bool wifi_reset;
 	bool wifi_on;
 	bool init_done;
+	bool deinit;
 	char country[3];
 	bool wakelock_waive;
-	struct wake_lock wakelock;
-	struct wake_lock rx_wakelock;
+	struct wakeup_source wakelock;
+	struct wakeup_source rx_wakelock;
 	spinlock_t wakelock_spinlock;	/* must be held before using wakelock */
 	unsigned int wakelock_counter;
 	unsigned int wakelock_waive_counter;
+	u16 pkt_filter_list;
+	void *fw_mem_dump;
+	size_t fw_mem_dump_len;
+	u8 enabled_ndev_num;
+	struct brcmf_andr_wake_counts *wake_cnts;
+	struct brcmf_andr_wake_bus_info *wake_info;
 };
 
+int brcmu_ether_atoe(const char *p,  char *ea);

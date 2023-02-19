@@ -1,17 +1,6 @@
+// SPDX-License-Identifier: ISC
 /*
  * Copyright (c) 2012 Broadcom Corporation
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
- * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
- * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
- * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
 #ifndef _fwil_h_
@@ -52,6 +41,7 @@
 #define BRCMF_C_REASSOC				53
 #define BRCMF_C_SET_ROAM_TRIGGER		55
 #define BRCMF_C_SET_ROAM_DELTA			57
+#define BRCMF_C_SET_MACLIST			70
 #define BRCMF_C_GET_BCNPRD			75
 #define BRCMF_C_SET_BCNPRD			76
 #define BRCMF_C_GET_DTIMPRD			77
@@ -60,6 +50,7 @@
 #define BRCMF_C_GET_PM				85
 #define BRCMF_C_SET_PM				86
 #define BRCMF_C_GET_REVINFO			98
+#define BRCMF_C_SET_MACMODE			106
 #define BRCMF_C_GET_CURR_RATESET		114
 #define BRCMF_C_GET_AP				117
 #define BRCMF_C_SET_AP				118
@@ -72,6 +63,8 @@
 #define BRCMF_C_GET_BSS_INFO			136
 #define BRCMF_C_GET_GET_PKTCNTS			137
 #define BRCMF_C_GET_BANDLIST			140
+#define BRCMF_C_GET_BAND			141
+#define BRCMF_C_SET_BAND			142
 #define BRCMF_C_SET_SCB_TIMEOUT			158
 #define BRCMF_C_GET_ASSOCLIST			159
 #define BRCMF_C_GET_PHYLIST			180
@@ -79,14 +72,21 @@
 #define BRCMF_C_SET_SCAN_UNASSOC_TIME		187
 #define BRCMF_C_SCB_DEAUTHENTICATE_FOR_REASON	201
 #define BRCMF_C_SET_ASSOC_PREFER		205
+#define BRCMF_C_GET_CHANNEL_SEL			215
+#define BRCMF_C_START_CHANNEL_SEL		216
 #define BRCMF_C_GET_VALID_CHANNELS		217
 #define BRCMF_C_SET_FAKEFRAG			219
 #define BRCMF_C_GET_KEY_PRIMARY			235
 #define BRCMF_C_SET_KEY_PRIMARY			236
+#define BRCMF_C_SET_SPECT_MANAGEMENT		244
+#define BRCMF_C_GET_SPECT_MANAGEMENT		245
 #define BRCMF_C_SET_SCAN_PASSIVE_TIME		258
 #define BRCMF_C_GET_VAR				262
 #define BRCMF_C_SET_VAR				263
 #define BRCMF_C_SET_WSEC_PMK			268
+
+#define BRCMF_FW_BADARG				2
+#define BRCMF_FW_UNSUPPORTED			23
 
 s32 brcmf_fil_cmd_data_set(struct brcmf_if *ifp, u32 cmd, void *data, u32 len);
 s32 brcmf_fil_cmd_data_get(struct brcmf_if *ifp, u32 cmd, void *data, u32 len);
