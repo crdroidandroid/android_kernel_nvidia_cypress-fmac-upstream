@@ -92,6 +92,11 @@ static int brcmf_max_pm;
 module_param_named(max_pm, brcmf_max_pm, int, 0);
 MODULE_PARM_DESC(max_pm, "Use max power management mode by default");
 
+static u32 brcm_vht_mask;
+module_param_named(vht_mask, brcm_vht_mask, int, 0);
+MODULE_PARM_DESC(vht_mask,
+		 "Disable VHT bonding support mask for the 5GHz band");
+
 #ifdef DEBUG
 /* always succeed brcmf_bus_started() */
 static int brcmf_ignore_probe_fail;
